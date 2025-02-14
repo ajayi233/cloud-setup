@@ -1,79 +1,94 @@
 AWSTemplateFormatVersion: "2010-09-09"
-Description: "Automate IAM User creation and logging of credentials using EventBridge and Lambda"
-
+Description: "IAM Automation Lab - Creates IAM Users, Groups, and EventBridge Rule"
+Parameters:
+  S3UserName:
+    Type: String
+    Default: "s3-user"
+    Description: "IAM username for S3 access"
+  EC2UserName:
+    Type: String
+    Default: "ec2-user"
+    Description: "IAM username for EC2 access"
+  S3UserEmail:
+    Type: String
+    Default: "s3user@example.com"
+    Description: "Email for the S3 user"
+  EC2UserEmail:
+    Type: String
+    Default: "ec2user@example.com"
+    Description: "Email for the EC2 user"
 Resources:
-  ## 🔹 Store Temporary Password in AWS Secrets Manager
-  OneTimePassword:
-    Type: "AWS::SecretsManager::Secret"
+  # 1. One-Time Password in Secrets Manager
+  TempPasswordSecret:
+    Type: AWS::SecretsManager::Secret
     Properties:
-      Name: "TemporaryUserPassword"
-      Description: "Temporary password for new IAM users"
+      Name: "OneTimePassword"
+      Description: "Temporary password for IAM users"
       GenerateSecretString:
-        SecretStringTemplate: '{"password": ""}'
-        GenerateStringKey: "password"
+        SecretStringTemplate: '{"Password":"Default@123"}'
+        GenerateStringKey: "Password"
         PasswordLength: 12
         ExcludeCharacters: '"@/\'
-
-  ## 🔹 Create IAM Groups
+  # 2. IAM Groups
   S3UserGroup:
-    Type: "AWS::IAM::Group"
+    Type: AWS::IAM::Group
     Properties:
-      GroupName: "S3ReadOnlyGroup"
-      ManagedPolicyArns:
-        - "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess"
-
+      GroupName: "S3UserGroup"
+      Policies:
+        - PolicyName: "S3ReadAccess"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action: "s3:ListBucket"
+                Resource: "*"
   EC2UserGroup:
-    Type: "AWS::IAM::Group"
+    Type: AWS::IAM::Group
     Properties:
-      GroupName: "EC2ReadOnlyGroup"
-      ManagedPolicyArns:
-        - "arn:aws:iam::aws:policy/AmazonEC2ReadOnlyAccess"
-
-  ## 🔹 Create IAM Users and Assign to Groups
+      GroupName: "EC2UserGroup"
+      Policies:
+        - PolicyName: "EC2ReadAccess"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action: "ec2:DescribeInstances"
+                Resource: "*"
+  # 3. IAM Users
   S3User:
-    Type: "AWS::IAM::User"
+    Type: AWS::IAM::User
     Properties:
-      UserName: "s3-user"
+      UserName: !Ref S3UserName
       Groups:
         - !Ref S3UserGroup
       LoginProfile:
-        Password: !Sub "{{resolve:secretsmanager:TemporaryUserPassword:SecretString:password}}"
+        Password: !Sub "{{resolve:secretsmanager:OneTimePassword:SecretString:Password}}"
         PasswordResetRequired: true
-      Tags:
-        - Key: "Email"
-          Value: !Sub "{{resolve:ssm:UserEmail-s3}}"
-
   EC2User:
-    Type: "AWS::IAM::User"
+    Type: AWS::IAM::User
     Properties:
-      UserName: "ec2-user"
+      UserName: !Ref EC2UserName
       Groups:
         - !Ref EC2UserGroup
       LoginProfile:
-        Password: !Sub "{{resolve:secretsmanager:TemporaryUserPassword:SecretString:password}}"
+        Password: !Sub "{{resolve:secretsmanager:OneTimePassword:SecretString:Password}}"
         PasswordResetRequired: true
-      Tags:
-        - Key: "Email"
-          Value: !Sub "{{resolve:ssm:UserEmail-ec2}}"
-
-  ## 🔹 Store User Emails in Parameter Store
-  S3UserEmail:
-    Type: "AWS::SSM::Parameter"
+  # 4. Store User Emails in Parameter Store
+  S3UserEmailParam:
+    Type: AWS::SSM::Parameter
     Properties:
-      Name: "UserEmail-s3"
-      Type: "String"
-      Value: "s3user@example.com"
-
-  EC2UserEmail:
-    Type: "AWS::SSM::Parameter"
+      Name: !Sub "/IAM/${S3UserName}-email"
+      Type: String
+      Value: !Ref S3UserEmail
+  EC2UserEmailParam:
+    Type: AWS::SSM::Parameter
     Properties:
-      Name: "UserEmail-ec2"
-      Type: "String"
-      Value: "ec2user@example.com"
-
-  ## 🔹 EventBridge Rule to Trigger Lambda
-  UserCreationRule:
-    Type: "AWS::Events::Rule"
+      Name: !Sub "/IAM/${EC2UserName}-email"
+      Type: String
+      Value: !Ref EC2UserEmail
+  # 5. EventBridge Rule
+  IAMUserEventRule:
+    Type: AWS::Events::Rule
     Properties:
       Name: "IAMUserCreationRule"
       EventPattern:
@@ -86,80 +101,66 @@ Resources:
             - "iam.amazonaws.com"
           eventName:
             - "CreateUser"
-      State: "ENABLED"
       Targets:
-        - Arn: !GetAtt NotifyLambda.Arn
-          Id: "LambdaTarget"
-
-  ## 🔹 Lambda Function for Logging Credentials
-  NotifyLambda:
-    Type: "AWS::Lambda::Function"
+        - Arn: !GetAtt IAMUserLambda.Arn
+          Id: "IAMUserLambdaTarget"
+  # 6. Lambda Function
+  IAMUserLambda:
+    Type: AWS::Lambda::Function
     Properties:
-      FunctionName: "LogNewUserCredentials"
-      Runtime: "python3.8"
-      Role: !GetAtt LambdaExecutionRole.Arn
+      FunctionName: "LogNewIAMUsers"
+      Runtime: python3.9
+      Role: !GetAtt IAMUserLambdaRole.Arn
       Handler: "index.lambda_handler"
       Code:
         ZipFile: |
           import boto3
           import json
           import logging
-          import os
-
-          logger = logging.getLogger()
-          logger.setLevel(logging.INFO)
-
           def lambda_handler(event, context):
               ssm = boto3.client('ssm')
               secretsmanager = boto3.client('secretsmanager')
-
-              for record in event['Records']:
-                  user_name = record['detail']['requestParameters']['userName']
-                  
-                  # Get email from Parameter Store
-                  email_param = f"UserEmail-{user_name}"
-                  email = ssm.get_parameter(Name=email_param)['Parameter']['Value']
-
-                  # Get Temporary Password from Secrets Manager
-                  password_secret = secretsmanager.get_secret_value(SecretId="TemporaryUserPassword")
-                  password = json.loads(password_secret['SecretString'])['password']
-
-                  logger.info(f"New IAM User Created: {user_name}, Email: {email}, Password: {password}")
-
-      MemorySize: 128
+              # Extract username from event
+              user_name = event['detail']['requestParameters']['userName']
+              try:
+                  # Retrieve email and password
+                  email_param_name = f"/IAM/{user_name}-email"
+                  email = ssm.get_parameter(Name=email_param_name)['Parameter']['Value']
+                  temp_password = secretsmanager.get_secret_value(SecretId="OneTimePassword")['SecretString']
+                  # Log the email and password
+                  logging.info(f"New User Created: {user_name}")
+                  logging.info(f"Email: {email}")
+                  logging.info(f"Temporary Password: {temp_password}")
+              except Exception as e:
+                  logging.error(f"Error retrieving details for {user_name}: {str(e)}")
       Timeout: 10
-
-  ## 🔹 Lambda Execution Role
-  LambdaExecutionRole:
-    Type: "AWS::IAM::Role"
+  # IAM Role for Lambda
+  IAMUserLambdaRole:
+    Type: AWS::IAM::Role
     Properties:
-      RoleName: "LambdaIAMUserLoggerRole"
+      RoleName: "IAMUserLambdaRole"
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
-          - Effect: "Allow"
+          - Effect: Allow
             Principal:
               Service: "lambda.amazonaws.com"
             Action: "sts:AssumeRole"
       Policies:
-        - PolicyName: "LambdaLoggingPolicy"
+        - PolicyName: "LambdaIAMUserLogPolicy"
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
-              - Effect: "Allow"
-                Action:
-                  - "logs:CreateLogGroup"
-                  - "logs:CreateLogStream"
-                  - "logs:PutLogEvents"
-                Resource: "*"
-              - Effect: "Allow"
+              - Effect: Allow
                 Action:
                   - "ssm:GetParameter"
                   - "secretsmanager:GetSecretValue"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
                 Resource: "*"
 
-Outputs:
-  LambdaFunctionArn:
-    Value: !GetAtt NotifyLambda.Arn
-    Description: "ARN of the Lambda function that logs user credentials"
+
+
+
+
 
